@@ -3,12 +3,20 @@
         "error": {
             "auth_error": "Authentication failed: {reason}"
         },
+        "abort": {
+            "get_access_token_error": "Failed to obtain a valid access token",
+            "auth_implementation_unset": "Authorization implementation is not set",
+            "oauth_token_error": "OAuth authorization processing failed",
+            "oauth_redirect_mismatch": "Web login is unavailable: Haier only accepts the callback {required}, but the callback derived from this Home Assistant instance is {current}. Set external_url under Settings > System > Network to a matching address and retry, or sign in with account and password instead.",
+            "already_configured": "This account is already configured. To switch sign-in method or re-authorize, remove the existing Haier integration from Settings > Devices & Services first."
+        },
         "step": {
             "user": {
                 "title": "Connect Haier",
                 "description": "Choose a sign-in method.",
                 "menu_options": {
-                    "phone_login": "Sign in by automatically getting a token with your account and password (recommended)",
+                    "oauth": "Sign in via official authorization to get a token (recommended)",
+                    "phone_login": "Sign in by automatically getting a token with your account and password",
                     "manual": "Sign in with a manually entered token (advanced)"
                 }
             },
@@ -32,6 +40,10 @@
         }
     },
     "options": {
+        "abort": {
+            "reauth_started": "Re-authentication started. Close this dialog and click Reconfigure.",
+            "already_configured": "This account is already used by another Haier integration."
+        },
         "error": {
             "auth_error": "Authentication failed: {reason}"
         },
@@ -48,7 +60,8 @@
                 "title": "Update account",
                 "description": "Choose a sign-in method.",
                 "menu_options": {
-                    "account_phone_login": "Sign in by automatically getting a token with your account and password (recommended)",
+                    "oauth": "Sign in via official authorization to get a token (recommended)",
+                    "account_phone_login": "Sign in by automatically getting a token with your account and password",
                     "account_manual": "Sign in with a manually entered token (advanced)"
                 }
             },
@@ -99,20 +112,6 @@
                     "device_id": "Target device（do not modify）",
                     "filter_method": "Filter method",
                     "target_entities": "Entities"
-                }
-            }
-        }
-    },
-    "services": {
-        "send_raw_command": {
-            "name": "Send raw command",
-            "description": "Send attributes unchanged using a Haier device ID.",
-            "fields": {
-                "device_id": {
-                    "name": "Haier device ID"
-                },
-                "attrs": {
-                    "name": "Attributes"
                 }
             }
         }
