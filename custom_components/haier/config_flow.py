@@ -5,12 +5,13 @@ from typing import Any
 
 import voluptuous as vol
 from homeassistant import config_entries
-from homeassistant.config_entries import ConfigFlowResult
+from homeassistant.config_entries import ConfigEntry, ConfigFlowResult
 from homeassistant.helpers import config_entry_oauth2_flow
+from homeassistant.helpers import device_registry as dr
 from homeassistant.helpers.config_entry_oauth2_flow import (
     async_register_implementation,
 )
-from homeassistant.core import callback
+from homeassistant.core import HomeAssistant, callback
 from homeassistant.data_entry_flow import AbortFlow
 from homeassistant.helpers.config_validation import multi_select
 
@@ -27,6 +28,7 @@ from .core.client import (
     HaierClientException,
     HaierClient,
     APP_SOURCE_APP,
+    APP_SOURCE_OAUTH,
     APP_SOURCE_WXAPP,
     DEFAULT_APP_SOURCE,
 )
@@ -38,14 +40,14 @@ from .core.config import (
 )
 
 from .haier import (
-    HaierAPIError,
-    HaierHttpClient,
+    async_get_account_info,
     generate_ag_client_id,
 )
 from .haier.oauth2 import (
     HaierOAuth2Implementation,
     get_redirect_uri,
     is_registered_callback,
+    supports_oauth2_login,
 )
 
 _LOGGER = logging.getLogger(__name__)
@@ -59,13 +61,78 @@ APP_SOURCE_OPTIONS = {
     APP_SOURCE_APP: "App",
 }
 
+ENTRY_TITLE_FORMAT = "Haier - {}"
+
+
+def _entry_title(identity: str) -> str:
+    """配置条目标题，格式须与 __init__._build_entry_unique_id 的解析保持一致。"""
+    return ENTRY_TITLE_FORMAT.format(identity)
+
+
+def _account_scope(account: dict[str, Any]) -> str:
+    """去重用的登录方式前缀。"""
+    return "oauth" if account.get("app_source") == APP_SOURCE_OAUTH else "phone"
+
+
+async def _async_device_conflicts(
+    hass: HomeAssistant,
+    account: dict[str, Any],
+    ignore_entry: ConfigEntry | None = None,
+) -> list[str]:
+    """找出与已有条目重叠的设备。
+
+    实体的 unique_id 只由设备 ID 派生（见 entity.py），同一台设备被两个条目
+    同时接入时，后加载的实体会因 unique_id 冲突被整批丢弃，表现为"第二个账号
+    拉取不到设备"。所以接入前先比对一次设备注册表。
+
+    :param hass: Home Assistant 实例
+    :param account: 待接入账号的认证信息
+    :param ignore_entry: 不参与比对的条目（重新认证/换号时传原条目，它本来
+        就持有这些设备）
+    :return: 冲突设备的描述列表，空列表表示没有冲突
+    """
+    try:
+        client = HaierClient(
+            hass, account["client_id"], account["token"], account["app_source"]
+        )
+        devices = await client.get_devices_basic()
+    except Exception as err:  # noqa: BLE001 - 检查失败不应阻塞接入流程
+        _LOGGER.warning("Device conflict check skipped: %s", err)
+        return []
+
+    registry = dr.async_get(hass)
+    known = {
+        identifier.lower()
+        for device in registry.devices.values()
+        for domain, identifier in device.identifiers
+        if domain == DOMAIN
+    }
+    if ignore_entry is not None:
+        owned = {
+            identifier.lower()
+            for device in dr.async_entries_for_config_entry(
+                registry, ignore_entry.entry_id
+            )
+            for domain, identifier in device.identifiers
+            if domain == DOMAIN
+        }
+        known -= owned
+
+    return [
+        "{}（{}）".format(item["name"], item["id"])
+        for item in devices
+        if item["id"].lower() in known
+    ]
+
 
 @dataclass(frozen=True)
 class AuthenticationResult:
     """认证成功结果。"""
 
     account: dict[str, Any]
-    mobile: str
+    # 账号标识：网页授权为 userId，账号密码/手动 Token 为手机号。
+    # 海尔的这两套账号体系无法互相换算，所以去重键是「登录方式:账号标识」。
+    identity: str
 
 
 class LoginFlowMixin:
@@ -95,7 +162,7 @@ class LoginFlowMixin:
                         "expires_at": int(time.time()) + token_info.expires_in,
                         "app_source": APP_SOURCE_APP,
                     },
-                    mobile=user_info["mobile"],
+                    identity=user_info["mobile"],
                 )
             except HaierClientException as e:
                 _LOGGER.warning(str(e))
@@ -142,7 +209,7 @@ class LoginFlowMixin:
                         "expires_at": int(time.time()) + token_info.expires_in,
                         "app_source": app_source,
                     },
-                    mobile=user_info["mobile"],
+                    identity=user_info["mobile"],
                 )
             except HaierClientException as e:
                 _LOGGER.warning(str(e))
@@ -189,6 +256,8 @@ class HaierConfigFlow(
         self._ag_client_id: str = ""
         self._token: dict[str, Any] = {}
         self._auth_implementation: str = ""
+        # 重新认证时指向被修复的原条目，为 None 表示添加新账号
+        self._reauth_entry: ConfigEntry | None = None
 
     @property
     def logger(self) -> logging.Logger:
@@ -208,8 +277,9 @@ class HaierConfigFlow(
 
         海尔的账号体系是两套：网页授权只拿得到 userId，账号密码登录只拿得到
         手机号，两者无法互相换算（account/info 只返回 userId/nickName）。因此
-        唯一键取「登录方式:账号标识」：同一种方式重复添加会被拦下，跨方式添加
-        仍会各自成条——这一点无法在客户端补上，只能靠用户先删旧条目。
+        唯一键取「登录方式:账号标识」：同一种方式重复添加会被拦下；跨方式添加
+        同一账号如果用的是同一批设备，则由 _async_abort_if_device_in_use 在
+        后面兜住。
 
         注意 async_set_unique_id 在这个 HA 版本是 async 方法，必须 await：
         漏掉 await 时协程不会执行，context 里的 unique_id 一直是 None，
@@ -224,6 +294,100 @@ class HaierConfigFlow(
         )
         self._abort_if_unique_id_configured()
 
+    def _async_abort_if_account_used_elsewhere(
+        self, scope: str, identity: str
+    ) -> ConfigFlowResult | None:
+        """重新认证时换了账号：确认新账号没被别的条目占用。
+
+        不能用 _abort_if_unique_id_configured，因为当前条目本身就可能持有
+        同一个 unique_id（重新授权同一账号是最常见的情况）。
+        """
+        unique_id = "{}:{}".format(scope, identity)
+        for other in self.hass.config_entries.async_entries(DOMAIN):
+            if self._reauth_entry and other.entry_id == self._reauth_entry.entry_id:
+                continue
+            if other.unique_id == unique_id:
+                return self.async_abort(reason="already_configured")
+        return None
+
+    async def _async_abort_if_device_in_use(
+        self, account: dict[str, Any], ignore_entry: ConfigEntry | None = None
+    ) -> ConfigFlowResult | None:
+        """设备与已有条目重叠时中止流程。
+
+        :param account: 待接入账号的认证信息
+        :param ignore_entry: 不参与比对的条目
+        :return: 有冲突时返回中止结果，否则返回 None
+        """
+        conflicts = await _async_device_conflicts(
+            self.hass, account, ignore_entry
+        )
+        if not conflicts:
+            return None
+
+        names = "、".join(conflicts)
+        _LOGGER.warning(
+            "Device(s) already managed by another Haier entry: %s", names
+        )
+        return self.async_abort(
+            reason="device_already_in_use",
+            description_placeholders={"devices": names},
+        )
+
+    async def _async_finish(self, result: AuthenticationResult) -> ConfigFlowResult:
+        """认证成功后的落库：新建条目，或在重新认证时更新原条目。"""
+        scope = _account_scope(result.account)
+
+        if self._reauth_entry is not None:
+            abort = self._async_abort_if_account_used_elsewhere(
+                scope, result.identity
+            )
+            if abort is not None:
+                return abort
+
+            # 重新认证可能换了账号：同样要挡住与别的条目重叠的设备
+            abort = await self._async_abort_if_device_in_use(
+                result.account, ignore_entry=self._reauth_entry
+            )
+            if abort is not None:
+                return abort
+
+            entry = self._reauth_entry
+            self.hass.config_entries.async_update_entry(
+                entry,
+                title=_entry_title(result.identity),
+                data={
+                    **entry.data,
+                    "account": result.account,
+                    "identity": result.identity,
+                },
+                unique_id="{}:{}".format(scope, result.identity),
+            )
+            return self.async_abort(reason="reauth_successful")
+
+        await self._async_ensure_unique_account(scope, result.identity)
+
+        abort = await self._async_abort_if_device_in_use(result.account)
+        if abort is not None:
+            return abort
+
+        return self.async_create_entry(
+            title=_entry_title(result.identity),
+            data={"account": result.account, "identity": result.identity},
+        )
+
+    async def async_step_reauth(
+        self, entry_data: dict[str, Any]
+    ) -> ConfigFlowResult:
+        """重新认证：授权失效后由 HA 触发，也可以从 Options 主动发起。"""
+        entry_id = self.context.get("entry_id")
+        self._reauth_entry = (
+            self.hass.config_entries.async_get_entry(entry_id) if entry_id else None
+        )
+        return self.async_show_menu(
+            step_id="reauth", menu_options=["oauth", "phone_login", "manual"]
+        )
+
     async def async_step_manual(
         self, user_input: dict[str, Any] | None = None
     ) -> ConfigFlowResult:
@@ -231,11 +395,7 @@ class HaierConfigFlow(
         if not isinstance(result, AuthenticationResult):
             return result
 
-        await self._async_ensure_unique_account("phone", result.mobile)
-
-        return self.async_create_entry(
-            title="Haier - {}".format(result.mobile), data={"account": result.account}
-        )
+        return await self._async_finish(result)
 
     async def async_step_phone_login(
         self, user_input: dict[str, Any] | None = None
@@ -245,18 +405,26 @@ class HaierConfigFlow(
         if not isinstance(result, AuthenticationResult):
             return result
 
-        await self._async_ensure_unique_account("phone", result.mobile)
-
-        return self.async_create_entry(
-            title="Haier - {}".format(result.mobile), data={"account": result.account}
-        )
+        return await self._async_finish(result)
 
     async def async_step_oauth(
         self, user_input: dict[str, Any] | None = None
     ) -> config_entries.ConfigFlowResult:
         """Handle OAuth authorization."""
+        if not supports_oauth2_login():
+            _LOGGER.error(
+                "oauth login unavailable: state helper missing in this HA version"
+            )
+            return self.async_abort(reason="oauth_unsupported_ha_version")
+
         if not self._ag_client_id:
-            self._ag_client_id = generate_ag_client_id(self._region)
+            # 重新认证时沿用原条目的 clientId，避免把账户重新绑到一个新实例上
+            if self._reauth_entry is not None:
+                cfg = AccountConfig(self.hass, self._reauth_entry)
+                if cfg.app_source == APP_SOURCE_OAUTH:
+                    self._ag_client_id = cfg.client_id
+            if not self._ag_client_id:
+                self._ag_client_id = generate_ag_client_id(self._region)
 
         # 海尔只为这个 client_id 注册了一个回调地址，且换 token 时会逐字符比对。
         # 先用 HA 的对外地址推导一次：不匹配就在这里说清楚，别让用户白跑一趟
@@ -299,18 +467,12 @@ class HaierConfigFlow(
         self._auth_implementation = auth_implementation
 
         try:
-            self._http_client = HaierHttpClient(
-                hass=self.hass,
-                region=self._region,
-                ag_client_id=self._ag_client_id,
-                language=self._language,
-                token_provider=lambda: self._token["access_token"],
-            )
-
-            account_info = await self._http_client.get_account_info()
-
-            await self._async_ensure_unique_account(
-                "oauth", str(account_info["userId"])
+            account_info = await async_get_account_info(
+                self.hass,
+                self._region,
+                self._ag_client_id,
+                self._token["access_token"],
+                self._language,
             )
 
             account = {
@@ -318,12 +480,11 @@ class HaierConfigFlow(
                 "token": self._token["access_token"],
                 "refresh_token": self._token["refresh_token"],
                 "expires_at": int(time.time()) + self._token["expires_in"],
-                "app_source": "oauth",
+                "app_source": APP_SOURCE_OAUTH,
             }
 
-            return self.async_create_entry(
-                title="Haier - {}".format(account_info["userId"]),
-                data={"account": account},
+            return await self._async_finish(
+                AuthenticationResult(account, str(account_info["userId"]))
             )
 
         except AbortFlow:
@@ -338,12 +499,26 @@ class HaierConfigFlow(
     def async_get_options_flow(
         config_entry: config_entries.ConfigEntry,
     ) -> config_entries.OptionsFlow:
-        return OptionsFlowHandler(config_entry)
+        # HA 2025.1 起 OptionsFlow 不再通过构造函数接收 config_entry，
+        # 统一走只读属性 self.config_entry
+        return OptionsFlowHandler()
 
 
 class OptionsFlowHandler(LoginFlowMixin, config_entries.OptionsFlow):
-    def __init__(self, config_entry: config_entries.ConfigEntry) -> None:
-        self._config_entry = config_entry
+    # 实体筛选的中间状态（先选设备再选实体），只在本次选项流存活期间有效。
+    # 以前存在 hass.data[DOMAIN]['entity_filter_target_device']，是全局共享的。
+    _entity_filter_target_device: str = ""
+
+    @property
+    def _devices(self):
+        """当前条目的设备列表。
+
+        以前读 hass.data[DOMAIN]['devices']，多个条目时拿到的是最后加载的那个
+        条目的设备，筛选或删除设备会操作到别的账号上。改为读本条目自己的运行时
+        状态（entry.runtime_data）。
+        """
+        runtime = getattr(self.config_entry, 'runtime_data', None)
+        return runtime.devices if runtime is not None else []
 
     async def async_step_init(
         self, user_input: dict[str, Any] | None = None
@@ -363,15 +538,39 @@ class OptionsFlowHandler(LoginFlowMixin, config_entries.OptionsFlow):
     ) -> ConfigFlowResult:
         """选择账户登录方式。"""
         return self.async_show_menu(
-            step_id="account", menu_options=["account_phone_login", "account_manual"]
+            step_id="account",
+            menu_options=["account_oauth", "account_phone_login", "account_manual"],
         )
+
+    async def async_step_account_oauth(
+        self, user_input: dict[str, Any] | None = None
+    ) -> ConfigFlowResult:
+        """网页授权登录：OptionsFlow 无法承接 OAuth 回调，转到重新认证流程。
+
+        海尔的 OAuth 回调固定打到 config entry flow（/auth/external/callback），
+        选项流拿不到回调，所以这里只负责拉起 reauth，真正的授权页在那边完成。
+        """
+        redirect_uri = get_redirect_uri(self.hass)
+        if not is_registered_callback(redirect_uri):
+            return self.async_abort(
+                reason="oauth_redirect_mismatch",
+                description_placeholders={
+                    "current": redirect_uri,
+                    "required": OAUTH2_CALLBACK_URL,
+                },
+            )
+
+        self.config_entry.async_start_reauth(self.hass)
+        return self.async_abort(reason="reauth_started")
 
     async def _async_save_account_authentication(
         self, result: AuthenticationResult
     ) -> ConfigFlowResult:
         """保存更新后的账户认证信息。"""
         # 换了账号就把唯一键一起改掉，否则之后用新账号再添加会被误判成"已配置"
-        new_unique_id = "phone:{}".format(result.mobile)
+        new_unique_id = "{}:{}".format(
+            _account_scope(result.account), result.identity
+        )
         for other in self.hass.config_entries.async_entries(DOMAIN):
             if (
                 other.entry_id != self.config_entry.entry_id
@@ -379,18 +578,27 @@ class OptionsFlowHandler(LoginFlowMixin, config_entries.OptionsFlow):
             ):
                 return self.async_abort(reason="already_configured")
 
-        cfg = AccountConfig(self.hass, self.config_entry)
-        cfg.client_id = result.account["client_id"]
-        cfg.token = result.account["token"]
-        cfg.refresh_token = result.account["refresh_token"]
-        cfg.expires_at = result.account["expires_at"]
-        cfg.app_source = result.account["app_source"]
-        cfg.save(result.mobile)
-
-        if self.config_entry.unique_id != new_unique_id:
-            self.hass.config_entries.async_update_entry(
-                self.config_entry, unique_id=new_unique_id
+        # 换账号也可能引入与别的条目重叠的设备，这里用的是同一条判断
+        conflicts = await _async_device_conflicts(
+            self.hass, result.account, ignore_entry=self.config_entry
+        )
+        if conflicts:
+            return self.async_abort(
+                reason="device_already_in_use",
+                description_placeholders={"devices": "、".join(conflicts)},
             )
+
+        # 账号、标题、唯一键一次写完：分多次 update 会触发多次重载
+        self.hass.config_entries.async_update_entry(
+            self.config_entry,
+            title=_entry_title(result.identity),
+            data={
+                **self.config_entry.data,
+                "account": result.account,
+                "identity": result.identity,
+            },
+            unique_id=new_unique_id,
+        )
 
         await self.hass.config_entries.async_reload(self.config_entry.entry_id)
 
@@ -470,7 +678,7 @@ class OptionsFlowHandler(LoginFlowMixin, config_entries.OptionsFlow):
             return self.async_create_entry(title="", data={})
 
         devices = {}
-        for item in self.hass.data[DOMAIN]["devices"]:
+        for item in self._devices:
             devices[item.id] = item.name
 
         return self.async_show_form(
@@ -499,13 +707,11 @@ class OptionsFlowHandler(LoginFlowMixin, config_entries.OptionsFlow):
         :return:
         """
         if user_input is not None:
-            self.hass.data[DOMAIN]["entity_filter_target_device"] = user_input[
-                "target_device"
-            ]
+            self._entity_filter_target_device = user_input["target_device"]
             return await self.async_step_entity_filter()
 
         devices = {}
-        for item in self.hass.data[DOMAIN]["devices"]:
+        for item in self._devices:
             devices[item.id] = item.name
 
         return self.async_show_form(
@@ -534,8 +740,8 @@ class OptionsFlowHandler(LoginFlowMixin, config_entries.OptionsFlow):
 
             return self.async_create_entry(title="", data={})
 
-        target_device_id = self.hass.data[DOMAIN].pop("entity_filter_target_device", "")
-        for device in self.hass.data[DOMAIN]["devices"]:
+        target_device_id = self._entity_filter_target_device
+        for device in self._devices:
             if device.id == target_device_id:
                 target_device = device
                 break

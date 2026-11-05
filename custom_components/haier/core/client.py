@@ -34,6 +34,9 @@ APP_SOURCES = {
     APP_SOURCE_WXAPP: ('MB-SHEZJAPPWXXCX-0000', '79ce99cc7f9804663939676031b8a427'),
     # App
     APP_SOURCE_APP: ('MB-UZHSH-0001', '5dfca8714eb26e3a776e58a8273c8752'),
+    # 网页授权签发的 token 走业务接口时仍用 wxapp 的凭据：uws 校验的是
+    # appId/appKey 组合，而该 token 的签发方不参与业务请求的签名。
+    APP_SOURCE_OAUTH: ('MB-SHEZJAPPWXXCX-0000', '79ce99cc7f9804663939676031b8a427'),
 }
 
 REFRESH_TOKEN_API = 'https://zj.haier.net/api-gw/oauthserver/account/v1/refreshToken'
@@ -252,6 +255,29 @@ class HaierClient:
                 devices.append(device)
 
             return devices
+
+    @retry_on_exception(exceptions=(aiohttp.ClientError, asyncio.TimeoutError))
+    async def get_devices_basic(self) -> List[Dict]:
+        """
+        只取设备 ID 与名称，不拉取数字模型。
+
+        供接入前的设备冲突检查使用：get_devices() 会为每台设备请求一次数字模型，
+        配置流程里不需要这份开销。
+
+        :return: [{'id': 设备ID, 'name': 设备名称}]
+        """
+        headers = await self._generate_common_headers(GET_DEVICES_API)
+        async with self._session.get(url=GET_DEVICES_API, headers=headers) as response:
+            content = await response.json(content_type=None)
+            self._assert_response_successful(content)
+
+            return [
+                {
+                    'id': item.get('deviceId', ''),
+                    'name': item.get('deviceName') or item.get('deviceId', '')
+                }
+                for item in content.get('deviceinfos', [])
+            ]
 
     @retry_on_exception(exceptions=(aiohttp.ClientError, asyncio.TimeoutError))
     async def get_digital_model(self, deviceId: str) -> list:
