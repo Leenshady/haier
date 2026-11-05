@@ -5,7 +5,6 @@ import random
 import string
 import time
 import uuid
-from collections.abc import Mapping
 from typing import Any
 
 _LOGGER = logging.getLogger(__name__)
@@ -43,7 +42,7 @@ def mask_token(token: str | None, prefix: int = 4) -> str:
 
 
 def validate_construct_token(token_data: dict[str, Any]) -> dict[str, Any]:
-    """Validate and construct token data."""
+    """把接口返回的 token 字段整理成 HA 惯用的形态。"""
     if not token_data:
         raise ValueError("Token data is empty")
     if not (
@@ -65,62 +64,3 @@ def validate_construct_token(token_data: dict[str, Any]) -> dict[str, Any]:
         expires_in,
     )
     return token
-
-
-def validate_token_structure(token: Any) -> None:
-    """Validate that a stored token is well-formed; raise ``ValueError`` if not.
-
-    A validate function only checks and raises — it returns ``None`` and does
-    not extract business values. A token is well-formed only when it carries
-    the four fields the OAuth flow / refresh produce: ``access_token``,
-    ``refresh_token``, ``expires_in`` and ``expires_at``.
-
-    Args:
-        token: token dict loaded from ``config_entry.data["token"]``.
-
-    Raises:
-        TypeError: when ``token`` is not a dict (wrong type).
-        ValueError: when the token is missing any of the four required fields.
-    """
-    if not isinstance(token, dict):
-        raise TypeError("Token is not a dict")
-    missing = [
-        name
-        for name, value in (
-            ("access_token", token.get("access_token")),
-            ("refresh_token", token.get("refresh_token")),
-            ("expires_in", token.get("expires_in")),
-            ("expires_at", token.get("expires_at")),
-        )
-        if not value
-    ]
-    if missing:
-        raise ValueError(f"Token missing required field(s): {', '.join(missing)}")
-
-
-def validate_entry_data(data: Mapping[str, Any]) -> None:
-    """Validate the config-flow-produced entry data; raise on invalid input.
-
-    The single place that checks the shape of ``config_entry.data`` at setup, so
-    the rest of setup can assume these fields exist instead of re-checking them.
-    It only validates and raises — it does not return or extract values.
-
-    Error semantics — two distinct kinds of breakage, surfaced as two distinct
-    exception types so the caller can react with the right user-facing action:
-
-    * ``ValueError``: the *token* structure is broken. This is recoverable by
-      re-authenticating (reauth), so the caller should raise
-      ``ConfigEntryAuthFailed``.
-    * ``KeyError``: non-token config-flow data (e.g. ``region``, ``language``,
-      ``ag_client_id``) is missing/corrupt. Reauth cannot repair this — the user
-      must re-run the whole config flow, so the caller should raise
-      ``ConfigEntryNotReady`` to surface that.
-    """
-    try:
-        validate_token_structure(data.get("token", {}))
-    except (TypeError, ValueError) as err:
-        raise ValueError(f"Token problem: {err}") from err
-
-    missing = [field for field in ("ag_client_id", "region", "language") if not data.get(field)]
-    if missing:
-        raise KeyError(f"Config entry missing field(s): {', '.join(missing)}")

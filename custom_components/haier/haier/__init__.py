@@ -1,21 +1,22 @@
-"""Haier cloud client package.
+"""海尔云端接入层。
 
-Groups the components that communicate with the Haier cloud:
+只包含「接入阶段」需要的东西：
 
-* :class:`HaierHttpClient` -- REST calls (homes, devices, digital models, scenes).
-* :class:`HaierWebSocketClient` -- real-time device push channel.
-* :class:`HaierCoordinator` -- owns the token, WebSocket and command dispatch.
-* :class:`HaierOAuth2Implementation` -- OAuth2 authorize / token / refresh flow.
-* :func:`generate_ag_client_id` -- builds the per-install client identifier.
+* :func:`async_get_account_info` -- 拿到 token 后读一次账户 userId。
+* :class:`HaierOAuth2Implementation` -- 授权页登录的 OAuth2 适配。
+* :func:`generate_ag_client_id` -- 生成每次安装唯一的 clientId。
+
+运行期的设备、家庭、场景接口在 ``core/client.py`` 的 ``HaierClient``，不要在
+这里再实现一份。
 """
 
-from .http_client import HaierAPIError, HaierHttpClient
+from .http_client import HaierAPIError, async_get_account_info
 from .oauth2 import HaierOAuth2Implementation
 from .utils import generate_ag_client_id
 
 __all__ = [
     "HaierAPIError",
-    "HaierHttpClient",
     "HaierOAuth2Implementation",
+    "async_get_account_info",
     "generate_ag_client_id",
 ]
