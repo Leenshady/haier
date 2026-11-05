@@ -8,7 +8,10 @@
             "auth_implementation_unset": "Authorization implementation is not set",
             "oauth_token_error": "OAuth authorization processing failed",
             "oauth_redirect_mismatch": "Web login is unavailable: Haier only accepts the callback {required}, but the callback derived from this Home Assistant instance is {current}. Set external_url under Settings > System > Network to a matching address and retry, or sign in with account and password instead.",
-            "already_configured": "This account is already configured. To switch sign-in method or re-authorize, remove the existing Haier integration from Settings > Devices & Services first."
+            "already_configured": "This account is already configured. To switch sign-in method or re-authorize, remove the existing Haier integration from Settings > Devices & Services first.",
+            "device_already_in_use": "Devices of this account are already managed by another Haier integration: {devices}. A device can only be managed by one integration. Remove the existing integration first if you want to switch accounts.",
+            "reauth_successful": "Re-authentication successful.",
+            "oauth_unsupported_ha_version": "This Home Assistant version does not provide the helper needed for web authorization. Please use phone + password or a manual token instead."
         },
         "step": {
             "user": {
@@ -36,13 +39,24 @@
                     "phone": "Phone number",
                     "password": "Password"
                 }
+            },
+            "reauth": {
+                "title": "Re-authenticate Haier",
+                "description": "Choose how to sign in again. Pick the method you used before to keep the current account.",
+                "menu_options": {
+                    "oauth": "Sign in via official authorization",
+                    "phone_login": "Sign in with account and password",
+                    "manual": "Sign in with a manually entered token"
+                }
             }
         }
     },
     "options": {
         "abort": {
-            "reauth_started": "Re-authentication started. Close this dialog and click Reconfigure.",
-            "already_configured": "This account is already used by another Haier integration."
+            "reauth_started": "Re-authentication started. Close this dialog and finish the authorization in the Haier integration card.",
+            "already_configured": "This account is already used by another Haier integration.",
+            "oauth_redirect_mismatch": "Web login is unavailable: Haier only accepts the callback {required}, but the callback derived from this Home Assistant instance is {current}. Set external_url under Settings > System > Network to a matching address and retry, or sign in with account and password instead.",
+            "device_already_in_use": "Devices of this account are already managed by another Haier integration: {devices}. A device can only be managed by one integration. Remove the existing integration first if you want to switch accounts."
         },
         "error": {
             "auth_error": "Authentication failed: {reason}"
@@ -60,7 +74,7 @@
                 "title": "Update account",
                 "description": "Choose a sign-in method.",
                 "menu_options": {
-                    "oauth": "Sign in via official authorization to get a token (recommended)",
+                    "account_oauth": "Re-authorize via official authorization",
                     "account_phone_login": "Sign in by automatically getting a token with your account and password",
                     "account_manual": "Sign in with a manually entered token (advanced)"
                 }
@@ -110,8 +124,22 @@
                 "description": "过滤方式为Exclude时，设备列表中已勾选的设备将不会接入；过滤方式为Include时则只接入设备列表中已勾选的设备",
                 "data": {
                     "device_id": "Target device（do not modify）",
-                    "filter_method": "Filter method",
+                    "filter_type": "Filter method",
                     "target_entities": "Entities"
+                }
+            }
+        }
+    },
+    "services": {
+        "send_raw_command": {
+            "name": "Send raw command",
+            "description": "Send attributes unchanged using a Haier device ID.",
+            "fields": {
+                "device_id": {
+                    "name": "Haier device ID"
+                },
+                "attrs": {
+                    "name": "Attributes"
                 }
             }
         }

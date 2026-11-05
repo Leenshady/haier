@@ -8,7 +8,10 @@
             "auth_implementation_unset": "授权实现未正确设置",
             "oauth_token_error": "OAuth 授权处理失败",
             "oauth_redirect_mismatch": "网页登录不可用：海尔只接受回调地址 {required}，而根据当前 Home Assistant 的访问地址推导出的回调是 {current}。请把「设置 → 系统 → 网络」中的 external_url 配置为与之匹配的地址后重试，或改用「账号密码登录」。",
-            "already_configured": "该账号已添加过，请勿重复添加。若要更换登录方式或重新授权，请先在「设置 → 设备与服务」中删除原有的 Haier 集成后再添加。"
+            "already_configured": "该账号已添加过，请勿重复添加。若要更换登录方式或重新授权，请先在「设置 → 设备与服务」中删除原有的 Haier 集成后再添加。",
+            "device_already_in_use": "该账号下的设备已被其他 Haier 集成接入：{devices}。一台设备只能由一个集成条目管理。如需换账号，请先删除原有条目再添加。",
+            "reauth_successful": "重新认证成功。",
+            "oauth_unsupported_ha_version": "当前 Home Assistant 版本不提供网页授权登录所需的接口，请改用手机号+密码登录或手动填写 Token。"
         },
         "step": {
             "user": {
@@ -36,13 +39,24 @@
                     "phone": "手机号",
                     "password": "密码"
                 }
+            },
+            "reauth": {
+                "title": "重新认证 Haier",
+                "description": "选择重新登录的方式。沿用原来的登录方式可以继续使用当前账号。",
+                "menu_options": {
+                    "oauth": "使用官方授权自动获取 Token 登录",
+                    "phone_login": "使用账号密码自动获取 Token 登录",
+                    "manual": "手动填写 Token 登录（高级）"
+                }
             }
         }
     },
     "options": {
         "abort": {
-            "reauth_started": "重新认证,关闭弹窗,点击重新配置按钮",
-            "already_configured": "该账号已被另一个 Haier 集成使用，请勿重复添加。"
+            "reauth_started": "已开始重新认证，请关闭此窗口，然后在 Haier 集成条目上完成授权。",
+            "already_configured": "该账号已被另一个 Haier 集成使用，请勿重复添加。",
+            "oauth_redirect_mismatch": "网页登录不可用：海尔只接受回调地址 {required}，而根据当前 Home Assistant 的访问地址推导出的回调是 {current}。请把「设置 → 系统 → 网络」中的 external_url 配置为与之匹配的地址后重试，或改用「账号密码登录」。",
+            "device_already_in_use": "该账号下的设备已被其他 Haier 集成接入：{devices}。一台设备只能由一个集成条目管理。如需换账号，请先删除原有条目再添加。"
         },
         "error": {
             "auth_error": "认证失败：{reason}"
@@ -60,7 +74,7 @@
                 "title": "更新账户",
                 "description": "选择一种登录方式。",
                 "menu_options": {
-                    "oauth": "使用官方授权自动获取 Token 登录（推荐）",
+                    "account_oauth": "改用官方授权登录（重新认证）",
                     "account_phone_login": "使用账号密码自动获取 Token 登录",
                     "account_manual": "手动填写 Token 登录（高级）"
                 }
@@ -112,6 +126,20 @@
                     "device_id": "目标设备（请勿修改）",
                     "filter_type": "筛选方式",
                     "target_entities": "实体列表"
+                }
+            }
+        }
+    },
+    "services": {
+        "send_raw_command": {
+            "name": "发送原始指令",
+            "description": "使用海尔原始设备ID发送属性，内容不做校验。",
+            "fields": {
+                "device_id": {
+                    "name": "海尔设备ID"
+                },
+                "attrs": {
+                    "name": "属性"
                 }
             }
         }
