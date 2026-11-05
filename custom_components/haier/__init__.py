@@ -5,7 +5,7 @@ from datetime import timedelta
 
 from homeassistant.config_entries import ConfigEntry
 from homeassistant.core import HomeAssistant
-from homeassistant.exceptions import ConfigEntryNotReady
+from homeassistant.exceptions import ConfigEntryAuthFailed, ConfigEntryNotReady
 from homeassistant.helpers.device_registry import DeviceEntry
 from homeassistant.helpers.event import async_track_time_interval
 
@@ -13,14 +13,12 @@ from .const import (
     DOMAIN,
     SUPPORTED_PLATFORMS,
     FILTER_TYPE_EXCLUDE,
-    FILTER_TYPE_INCLUDE,
     TOKEN_BUFFER_INTERVAL,
 )
 from .core.client import (
     APP_SOURCE_OAUTH,
     HaierClient,
     HaierClientException,
-    TokenInfo,
 )
 from .core.config import (
     AccountConfig,
@@ -30,6 +28,7 @@ from .core.config import (
 )
 from .core.device_gateway import HaierDeviceGateway
 from .core.migration import CONFIG_ENTRY_MIGRATOR
+from .core.runtime import HaierRuntimeData
 from .services import async_setup_services, async_unload_services
 
 _LOGGER = logging.getLogger(__name__)
@@ -41,14 +40,20 @@ _OAUTH_REFRESH_GUARD_SECONDS = 300
 
 
 _ENTRY_TITLE_PREFIX = 'Haier - '
+# 旧版本经 Options 换号后标题写成 'Haier: {账号}'，解析时一并兼容
+_LEGACY_TITLE_PREFIX = 'Haier: '
 
 
 def _build_entry_unique_id(entry: ConfigEntry) -> str | None:
     """按「登录方式:账号标识」生成唯一键。
 
     网页授权只拿得到 userId，账号密码登录只拿得到手机号，两套体系无法换算，
-    所以唯一键带上前缀区分来源。老条目没存 userId，只能从 title 里取
-    （title 格式固定为 "Haier - {账号标识}"，由 config_flow 写入）。
+    所以唯一键带上前缀区分来源。
+
+    账号标识优先取 entry.data['identity']（新条目写入）；老条目没有这个字段，
+    只能从 title 里取（格式为 "Haier - {账号标识}"，历史上有过 "Haier: "
+    的写法，两种都认）。用户手动改过标题的老条目会取不到，此时返回 None，
+    该条目保持无 unique_id，不会被误拦。
 
     :param entry: 配置条目
     :return: 唯一键，取不到时返回 None
@@ -60,11 +65,14 @@ def _build_entry_unique_id(entry: ConfigEntry) -> str | None:
         except ValueError:
             account = {}
 
-    title = entry.title or ''
-    if not title.startswith(_ENTRY_TITLE_PREFIX):
-        return None
+    identity = str(entry.data.get('identity') or '').strip()
+    if not identity:
+        title = entry.title or ''
+        for prefix in (_ENTRY_TITLE_PREFIX, _LEGACY_TITLE_PREFIX):
+            if title.startswith(prefix):
+                identity = title[len(prefix):].strip()
+                break
 
-    identity = title[len(_ENTRY_TITLE_PREFIX):].strip()
     if not identity:
         return None
 
@@ -88,16 +96,9 @@ async def async_migrate_entry(hass: HomeAssistant, entry: ConfigEntry) -> bool:
 
 
 async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
-    hass.data.setdefault(DOMAIN, {
-        'devices': [],
-        'cancel_token_updater': None,
-        'gateway_task': None,
-        'gateway_connected': False,
-    })
-
     # 定时更新token
     try:
-        hass.data[DOMAIN]['cancel_token_updater'] = await token_updater(hass, entry)
+        cancel_token_updater = await token_updater(hass, entry)
     except HaierClientException as err:
         raise ConfigEntryNotReady('Haier authentication failed') from err
 
@@ -105,20 +106,29 @@ async def async_setup_entry(hass: HomeAssistant, entry: ConfigEntry):
     preferences_cfg = PreferencesConfig(hass, entry)
     client = HaierClient(hass, account_cfg.client_id, account_cfg.token, account_cfg.app_source)
 
-    # 是否忽略设备离线状态，供实体在收到离线事件时判断是否保留最后状态
-    hass.data[DOMAIN]['ignore_device_offline'] = preferences_cfg.ignore_device_offline
-
     devices = await client.get_devices()
     _LOGGER.info('共获取到{}个设备'.format(len(devices)))
-    hass.data[DOMAIN]['devices'] = devices
+
+    gateway = HaierDeviceGateway(hass, client, account_cfg.token, entry.entry_id)
+
+    # 每个条目一份运行时状态。原先放在 hass.data[DOMAIN] 里，多个条目会互相
+    # 覆盖设备列表与任务槽位，卸载任一条目还会把整块数据删掉。
+    runtime = HaierRuntimeData(
+        entry_id=entry.entry_id,
+        client=client,
+        devices=devices,
+        gateway=gateway,
+        ignore_device_offline=preferences_cfg.ignore_device_offline,
+        cancel_token_updater=cancel_token_updater,
+    )
+    entry.runtime_data = runtime
 
     await hass.config_entries.async_forward_entry_setups(entry, SUPPORTED_PLATFORMS)
 
     # 实体完成注册后再启动网关，避免初始快照事件无人监听。
-    gateway = HaierDeviceGateway(hass, client, account_cfg.token)
-    hass.data[DOMAIN]['gateway_task'] = hass.async_create_background_task(
+    runtime.gateway_task = hass.async_create_background_task(
         gateway.connect(devices),
-        'haier-gateway'
+        'haier-gateway-{}'.format(entry.entry_id)
     )
 
     entry.async_on_unload(entry.add_update_listener(entry_update_listener))
@@ -154,9 +164,12 @@ async def _try_update_oauth_token(hass: HomeAssistant, entry: ConfigEntry, cfg: 
     try:
         token_info = await client.oauth_refresh_token(cfg.refresh_token)
     except HaierClientException as err:
-        # 已过期且刷新失败：交给上层把条目置为需要重新授权
+        # 已过期且刷新失败：refresh_token 已失效，只能重新授权。
+        # 交给 HA 拉起 reauth 流程，否则条目会一直用死 token 空转。
         if remaining <= 0:
-            raise
+            raise ConfigEntryAuthFailed(
+                'web-auth token expired, re-authorization required'
+            ) from err
 
         # 只是提前续期没成功，现有token仍然可用，下一轮再试，不打断集成
         _LOGGER.warning('web-auth token refresh failed, keep current token: %s', err)
@@ -220,6 +233,10 @@ async def token_updater(hass: HomeAssistant, entry: ConfigEntry):
                 await hass.config_entries.async_reload(entry.entry_id)
             else:
                 _LOGGER.debug('token is valid')
+        except ConfigEntryAuthFailed:
+            # 续期失败且 token 已过期：让用户重新授权，别静默空转
+            _LOGGER.warning('token expired, starting re-authorization')
+            entry.async_start_reauth(hass)
         except HaierClientException:
             _LOGGER.warning('token refresh authentication failed')
         except Exception:
@@ -235,19 +252,28 @@ async def async_unload_entry(hass: HomeAssistant, entry: ConfigEntry):
     if not await hass.config_entries.async_unload_platforms(entry, SUPPORTED_PLATFORMS):
         return False
 
-    # 停止token更新
-    if hass.data[DOMAIN]['cancel_token_updater']:
-        hass.data[DOMAIN]['cancel_token_updater']()
-        _LOGGER.info('token updater stopped')
+    runtime: HaierRuntimeData | None = getattr(entry, 'runtime_data', None)
+    if runtime is not None:
+        # 停止token更新
+        if runtime.cancel_token_updater:
+            runtime.cancel_token_updater()
+            _LOGGER.info('token updater stopped')
 
-    # 断开网关
-    if hass.data[DOMAIN]['gateway_task']:
-        hass.data[DOMAIN]['gateway_task'].cancel()
-        _LOGGER.info('gateway task cancelled')
+        # 断开网关
+        if runtime.gateway_task:
+            runtime.gateway_task.cancel()
+            _LOGGER.info('gateway task cancelled')
 
-    async_unload_services(hass)
+    # 服务是 domain 级的，只在最后一个条目卸载时注销，
+    # 否则另一个条目还在跑却调不到 send_raw_command
+    if not [
+        item for item in hass.config_entries.async_entries(DOMAIN)
+        if item.entry_id != entry.entry_id
+    ]:
+        async_unload_services(hass)
 
-    del hass.data[DOMAIN]
+    # 刷新节流是按 entry 记的，条目卸载后这条记录没有意义了
+    _OAUTH_REFRESHED_AT.pop(entry.entry_id, None)
 
     return True
 
@@ -261,11 +287,14 @@ async def async_remove_config_entry_device(hass: HomeAssistant, config: ConfigEn
 
     _LOGGER.info('Device [{}] removing...'.format(device_id))
 
-    for device in hass.data[DOMAIN]['devices']:
-        if device.id.lower() == device_id:
-            target_device = device
+    runtime: HaierRuntimeData | None = getattr(config, 'runtime_data', None)
+    target_device = None
+    for item in runtime.devices if runtime is not None else []:
+        if item.id.lower() == device_id.lower():
+            target_device = item
             break
-    else:
+
+    if target_device is None:
         _LOGGER.error('Device [{}] not found'.format(device_id))
         return False
 
@@ -282,8 +311,9 @@ async def async_remove_config_entry_device(hass: HomeAssistant, config: ConfigEn
     return True
 
 async def async_register_entity(hass: HomeAssistant, entry: ConfigEntry, async_add_entities, platform, setup) -> None:
+    runtime: HaierRuntimeData = entry.runtime_data
     entities = []
-    for device in hass.data[DOMAIN]['devices']:
+    for device in runtime.devices:
         if DeviceFilterConfig.is_skip(hass, entry, device.id):
             continue
 
@@ -294,6 +324,6 @@ async def async_register_entity(hass: HomeAssistant, entry: ConfigEntry, async_a
             if EntityFilterConfig.is_skip(hass, entry, device.id, attribute.key):
                 continue
 
-            entities.append(setup(device, attribute))
+            entities.append(setup(device, attribute, runtime))
 
     async_add_entities(entities)
